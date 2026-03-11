@@ -1,5 +1,5 @@
 from django.urls import path
-from apps import (
+from apps.ingest.views import (
     IngestDatasetView,
     IngestStatusView,
     DatasetListView,

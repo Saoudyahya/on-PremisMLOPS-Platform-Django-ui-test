@@ -2,13 +2,14 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework import status
-from mlops_api.services import (
+from DjangoProject.services import (
     upload_to_minio,
     trigger_ingest_dag,
     get_dag_run_status,
     list_researcher_datasets,
     generate_presigned_download_url,
 )
+
 
 
 class IngestDatasetView(APIView):
