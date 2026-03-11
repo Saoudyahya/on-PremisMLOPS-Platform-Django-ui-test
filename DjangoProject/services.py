@@ -3,6 +3,7 @@ import requests
 from django.conf import settings
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from datetime import datetime, timezone
 
 
 def get_s3_client():
@@ -26,17 +27,46 @@ def upload_to_minio(file_obj, researcher_id: str, filename: str) -> str:
     return key
 
 
-def trigger_ingest_dag(researcher_id: str, dataset: str) -> dict:
-    url = f"{settings.AIRFLOW_URL}/api/v2/dags/ingest_dag/dagRuns"
-
-
+def get_airflow_token() -> str:
     response = requests.post(
-        url,
-        json={"conf": {"dataset": dataset, "researcher_id": researcher_id}},
-        auth=(settings.AIRFLOW_USERNAME, settings.AIRFLOW_PASSWORD),
+        f"{settings.AIRFLOW_URL}/auth/token",   # ← /auth/token not /api/v2/auth/token
+        json={"username": settings.AIRFLOW_USERNAME, "password": settings.AIRFLOW_PASSWORD},
         headers={"Content-Type": "application/json"},
         timeout=10,
-        verify=False,   # ← add this
+    )
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+
+def trigger_ingest_dag(researcher_id: str, dataset: str) -> dict:
+    token = get_airflow_token()
+
+    response = requests.post(
+        f"{settings.AIRFLOW_URL}/api/v2/dags/ingest_dag/dagRuns",
+        json={
+            "logical_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "conf": {
+                "dataset": dataset,
+                "researcher_id": researcher_id
+            }
+        },
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def get_dag_run_status(dag_run_id: str) -> dict:
+    token = get_airflow_token()
+
+    response = requests.get(
+        f"{settings.AIRFLOW_URL}/api/v2/dags/ingest_dag/dagRuns/{dag_run_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
     )
     response.raise_for_status()
     return response.json()
