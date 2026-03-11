@@ -1,0 +1,6 @@
+django
+djangorestframework
+boto3
+requests
+python-decouple
+django-cors-headers
