@@ -9,8 +9,7 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "rest_framework",
     "corsheaders",
-    "mlops_api.apps.ingest",
-    "mlops_api.apps.auth",
+    "apps.ingest",
 ]
 
 MIDDLEWARE = [
@@ -18,7 +17,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
 ]
 
-ROOT_URLCONF = "mlops_api.urls"
+ROOT_URLCONF = "DjangoProject.urls"
 CORS_ALLOW_ALL_ORIGINS = True
 
 # MinIO
