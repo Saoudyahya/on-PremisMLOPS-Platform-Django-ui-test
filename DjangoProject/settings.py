@@ -3,6 +3,7 @@ from decouple import config
 SECRET_KEY = config("DJANGO_SECRET_KEY", default="change-me-in-production")
 DEBUG      = config("DEBUG", default=True, cast=bool)
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*").split(",")
+AIRFLOW_PASSWORD = config("AIRFLOW_PASSWORD", default="admin123")
 
 INSTALLED_APPS = [
     "django.contrib.contenttypes",
