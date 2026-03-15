@@ -1,5 +1,6 @@
 import boto3
 import requests
+from datetime import datetime, timezone
 from django.conf import settings
 
 
@@ -15,10 +16,6 @@ def get_s3_client():
 
 
 def upload_to_minio(file_obj, researcher_id: str, filename: str) -> str:
-    """
-    Upload file to MinIO at <researcher_id>/datasets/<filename>.
-    Returns the S3 key.
-    """
     s3  = get_s3_client()
     key = f"{researcher_id}/datasets/{filename}"
     s3.upload_fileobj(file_obj, settings.MINIO_BUCKET, key)
@@ -26,14 +23,10 @@ def upload_to_minio(file_obj, researcher_id: str, filename: str) -> str:
 
 
 def list_researcher_datasets(researcher_id: str) -> list:
-    """
-    List all datasets stored under <researcher_id>/datasets/.
-    """
     s3       = get_s3_client()
     prefix   = f"{researcher_id}/datasets/"
     response = s3.list_objects_v2(Bucket=settings.MINIO_BUCKET, Prefix=prefix)
     objects  = response.get("Contents", [])
-
     return [
         {
             "key":           obj["Key"],
@@ -47,9 +40,6 @@ def list_researcher_datasets(researcher_id: str) -> list:
 
 
 def generate_presigned_download_url(researcher_id: str, filename: str, expires: int = 3600) -> str:
-    """
-    Generate a presigned URL for downloading a dataset.
-    """
     s3  = get_s3_client()
     key = f"{researcher_id}/datasets/{filename}"
     return s3.generate_presigned_url(
@@ -61,73 +51,98 @@ def generate_presigned_download_url(researcher_id: str, filename: str, expires: 
 
 # ── Airflow helpers ────────────────────────────────────────────────────────────
 
+def _get_airflow_jwt() -> str:
+    """
+    Airflow 3 requires a JWT obtained via POST /auth/token.
+    Basic Auth directly on /api/v2/ is not supported.
+    """
+    resp = requests.post(
+        f"{settings.AIRFLOW_URL}/auth/token",
+        json={
+            "username": settings.AIRFLOW_USERNAME,
+            "password": settings.AIRFLOW_PASSWORD,
+        },
+        headers={"Content-Type": "application/json"},
+        timeout=15,
+    )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Airflow /auth/token returned {resp.status_code}: {resp.text}"
+        )
+    data  = resp.json()
+    token = data.get("access_token") or data.get("token")
+    if not token:
+        raise RuntimeError(f"Airflow /auth/token had no token field: {resp.text}")
+    return token
+
+
 def _airflow_headers() -> dict:
-    """Basic-auth headers for the Airflow REST API."""
-    import base64
-    credentials = base64.b64encode(
-        f"{settings.AIRFLOW_USERNAME}:{settings.AIRFLOW_PASSWORD}".encode()
-    ).decode()
     return {
-        "Authorization": f"Basic {credentials}",
+        "Authorization": f"Bearer {_get_airflow_jwt()}",
         "Content-Type":  "application/json",
     }
 
 
-def trigger_notebook_launch(username: str) -> dict:
+def _ensure_dag_unpaused(dag_id: str) -> None:
     """
-    Trigger the launch_notebook_dag Airflow DAG for the given JupyterHub username.
-
-    Calls:
-        POST <AIRFLOW_URL>/api/v1/dags/launch_notebook_dag/dagRuns
-
-    Returns the DAG run info dict on success.
-    Raises RuntimeError on HTTP error.
+    PATCH /api/v2/dags/<dag_id> with is_paused=false.
+    Airflow ignores this if the DAG is already unpaused.
+    is_paused_upon_creation=False in the DAG file only works for brand-new DAGs
+    that have never been registered — once a DAG exists in the DB as paused,
+    that flag has no effect. This call fixes it unconditionally.
     """
-    url = f"{settings.AIRFLOW_URL}/api/v1/dags/launch_notebook_dag/dagRuns"
-
-    payload = {
-        "conf": {
-            "username": username,
-        }
-    }
-
-    resp = requests.post(
-        url,
-        json=payload,
+    resp = requests.patch(
+        f"{settings.AIRFLOW_URL}/api/v2/dags/{dag_id}",
+        json={"is_paused": False},
         headers=_airflow_headers(),
         timeout=15,
     )
-
     if resp.status_code not in (200, 201):
         raise RuntimeError(
-            f"Airflow returned {resp.status_code}: {resp.text}"
+            f"Failed to unpause DAG {dag_id}: {resp.status_code}: {resp.text}"
         )
 
+
+def trigger_dag(dag_id: str, conf: dict) -> dict:
+    """
+    Generic helper: unpause a DAG then trigger a run with the given conf.
+    Returns the DAG run info dict.
+    """
+    _ensure_dag_unpaused(dag_id)
+
+    resp = requests.post(
+        f"{settings.AIRFLOW_URL}/api/v2/dags/{dag_id}/dagRuns",
+        json={
+            "conf":         conf,
+            # Airflow 3 requires logical_date in the POST body
+            "logical_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        headers=_airflow_headers(),
+        timeout=15,
+    )
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Airflow returned {resp.status_code}: {resp.text}")
+    return resp.json()
+
+
+def trigger_notebook_launch(username: str) -> dict:
+    return trigger_dag("launch_notebook_dag", {"username": username})
+
+
+def trigger_ingest(dataset: str, researcher_id: str) -> dict:
+    return trigger_dag("ingest_dag", {"dataset": dataset, "researcher_id": researcher_id})
+
+
+def get_dag_run_status(dag_id: str, dag_run_id: str) -> dict:
+    resp = requests.get(
+        f"{settings.AIRFLOW_URL}/api/v2/dags/{dag_id}/dagRuns/{dag_run_id}",
+        headers=_airflow_headers(),
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Airflow returned {resp.status_code}: {resp.text}")
     return resp.json()
 
 
 def get_notebook_run_status(dag_run_id: str) -> dict:
-    """
-    Poll the status of a previously triggered DAG run.
-
-    Calls:
-        GET <AIRFLOW_URL>/api/v1/dags/launch_notebook_dag/dagRuns/<dag_run_id>
-
-    Returns the DAG run info dict.
-    """
-    url = (
-        f"{settings.AIRFLOW_URL}/api/v1/dags/launch_notebook_dag/dagRuns/{dag_run_id}"
-    )
-
-    resp = requests.get(
-        url,
-        headers=_airflow_headers(),
-        timeout=15,
-    )
-
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Airflow returned {resp.status_code}: {resp.text}"
-        )
-
-    return resp.json()
+    return get_dag_run_status("launch_notebook_dag", dag_run_id)
