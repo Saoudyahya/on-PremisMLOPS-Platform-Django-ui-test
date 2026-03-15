@@ -6,8 +6,12 @@ from DjangoProject.services import (
     upload_to_minio,
     list_researcher_datasets,
     generate_presigned_download_url,
+    trigger_notebook_launch,
+    get_notebook_run_status,
 )
 
+
+# ── Dataset endpoints ──────────────────────────────────────────────────────────
 
 class IngestDatasetView(APIView):
     """
@@ -75,4 +79,103 @@ class DatasetDownloadView(APIView):
         return Response({
             "url":     url,
             "expires": "3600s",
+        })
+
+
+# ── Notebook endpoints ─────────────────────────────────────────────────────────
+
+class LaunchNotebookView(APIView):
+    """
+    POST /api/notebook/launch/
+    JSON body: { "username": "<jupyterhub_username>" }
+
+    Triggers the launch_notebook_dag Airflow DAG which:
+      1. Creates the JupyterHub user if it doesn't exist
+      2. Spawns the notebook server
+      3. Polls until the server is ready
+
+    Returns the Airflow DAG run ID so the client can poll status separately.
+
+    Example request:
+        curl -X POST http://localhost:8000/api/notebook/launch/ \\
+             -H "Content-Type: application/json" \\
+             -d '{"username": "researcher_abc"}'
+
+    Example response:
+        {
+            "message":     "Notebook launch triggered",
+            "username":    "researcher_abc",
+            "dag_run_id":  "manual__2026-03-15T00:27:19.203409+00:00",
+            "state":       "queued",
+            "notebook_url": "http://proxy-public.mlops-jupyterhub.svc.cluster.local:80/user/researcher_abc/lab"
+        }
+    """
+
+    def post(self, request):
+        username = request.data.get("username", "").strip()
+
+        if not username:
+            return Response(
+                {"error": "username is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            dag_run = trigger_notebook_launch(username)
+        except RuntimeError as e:
+            return Response({"error": str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        dag_run_id = dag_run.get("dag_run_id", "")
+
+        return Response(
+            {
+                "message":      "Notebook launch triggered",
+                "username":     username,
+                "dag_run_id":   dag_run_id,
+                "state":        dag_run.get("state", "queued"),
+                # Convenience link — the server won't be ready immediately.
+                # Poll /api/notebook/status/<dag_run_id>/ until state == "success".
+                "notebook_url": f"http://jupyter.yourdomain.com/user/{username}/lab",
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class NotebookStatusView(APIView):
+    """
+    GET /api/notebook/status/<dag_run_id>/
+    Poll the status of a notebook launch DAG run.
+
+    Possible states returned by Airflow:
+        queued | running | success | failed
+
+    When state == "success" the notebook server is ready and notebook_url is live.
+
+    Example request:
+        curl http://localhost:8000/api/notebook/status/manual__2026-03-15T00:27:19.203409+00:00/
+
+    Example response:
+        {
+            "dag_run_id": "manual__2026-03-15T00:27:19.203409+00:00",
+            "state":      "success",
+            "ready":      true
+        }
+    """
+
+    def get(self, request, dag_run_id):
+        try:
+            run_info = get_notebook_run_status(dag_run_id)
+        except RuntimeError as e:
+            return Response({"error": str(e)}, status=status.HTTP_502_BAD_GATEWAY)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        state = run_info.get("state", "unknown")
+
+        return Response({
+            "dag_run_id": dag_run_id,
+            "state":      state,
+            "ready":      state == "success",
         })

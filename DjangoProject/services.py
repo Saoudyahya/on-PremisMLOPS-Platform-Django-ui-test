@@ -1,6 +1,9 @@
 import boto3
+import requests
 from django.conf import settings
 
+
+# ── MinIO / S3 helpers ─────────────────────────────────────────────────────────
 
 def get_s3_client():
     return boto3.client(
@@ -18,7 +21,6 @@ def upload_to_minio(file_obj, researcher_id: str, filename: str) -> str:
     """
     s3  = get_s3_client()
     key = f"{researcher_id}/datasets/{filename}"
-
     s3.upload_fileobj(file_obj, settings.MINIO_BUCKET, key)
     return key
 
@@ -50,9 +52,82 @@ def generate_presigned_download_url(researcher_id: str, filename: str, expires: 
     """
     s3  = get_s3_client()
     key = f"{researcher_id}/datasets/{filename}"
-
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": settings.MINIO_BUCKET, "Key": key},
         ExpiresIn=expires,
     )
+
+
+# ── Airflow helpers ────────────────────────────────────────────────────────────
+
+def _airflow_headers() -> dict:
+    """Basic-auth headers for the Airflow REST API."""
+    import base64
+    credentials = base64.b64encode(
+        f"{settings.AIRFLOW_USERNAME}:{settings.AIRFLOW_PASSWORD}".encode()
+    ).decode()
+    return {
+        "Authorization": f"Basic {credentials}",
+        "Content-Type":  "application/json",
+    }
+
+
+def trigger_notebook_launch(username: str) -> dict:
+    """
+    Trigger the launch_notebook_dag Airflow DAG for the given JupyterHub username.
+
+    Calls:
+        POST <AIRFLOW_URL>/api/v1/dags/launch_notebook_dag/dagRuns
+
+    Returns the DAG run info dict on success.
+    Raises RuntimeError on HTTP error.
+    """
+    url = f"{settings.AIRFLOW_URL}/api/v1/dags/launch_notebook_dag/dagRuns"
+
+    payload = {
+        "conf": {
+            "username": username,
+        }
+    }
+
+    resp = requests.post(
+        url,
+        json=payload,
+        headers=_airflow_headers(),
+        timeout=15,
+    )
+
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Airflow returned {resp.status_code}: {resp.text}"
+        )
+
+    return resp.json()
+
+
+def get_notebook_run_status(dag_run_id: str) -> dict:
+    """
+    Poll the status of a previously triggered DAG run.
+
+    Calls:
+        GET <AIRFLOW_URL>/api/v1/dags/launch_notebook_dag/dagRuns/<dag_run_id>
+
+    Returns the DAG run info dict.
+    """
+    url = (
+        f"{settings.AIRFLOW_URL}/api/v1/dags/launch_notebook_dag/dagRuns/{dag_run_id}"
+    )
+
+    resp = requests.get(
+        url,
+        headers=_airflow_headers(),
+        timeout=15,
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Airflow returned {resp.status_code}: {resp.text}"
+        )
+
+    return resp.json()
